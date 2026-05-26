@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Resolve symlinks so this works when invoked as ~/.local/bin/pitv
+# (which the installer symlinks at ~/pitv/pitv-run).
+SCRIPT="$(readlink -f "${BASH_SOURCE[0]}")"
+DIR="$(cd "$(dirname "$SCRIPT")" && pwd)"
+cd "$DIR"
+exec python3 -m pitv "$@"

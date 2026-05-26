@@ -1,0 +1,3 @@
+# Pi-TV has no required pip packages — stdlib only.
+# Optional on Raspberry Pi for reliable remote/keyboard input while mpv is fullscreen:
+evdev>=1.6.0; sys_platform == 'linux'
