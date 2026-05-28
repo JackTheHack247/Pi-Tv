@@ -1,0 +1,498 @@
+import sys
+import json
+import urllib.request
+import urllib.parse
+from enum import Enum
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QKeyEvent
+from PyQt6.QtWidgets import (
+    QApplication, QGridLayout, QHBoxLayout, QLabel,
+    QMainWindow, QProgressBar, QStackedWidget, QVBoxLayout, QWidget, QFrame
+)
+import vlc
+
+# =========================================================
+# TVHEADEND ENDPOINT HARDWARE INTEGRATION TARGETS
+# =========================================================
+TVH_HOST = "127.0.0.1"
+TVH_PORT = "9981"
+TVH_USER = ""       # Add your local authentication username if configured
+TVH_PASS = ""       # Add your local authentication password if configured
+
+def make_tvh_request(endpoint, post_data=None):
+    """Executes a live synchronous network request targeting the Tvheadend API."""
+    auth_prefix = f"{TVH_USER}:{TVH_PASS}@" if TVH_USER and TVH_PASS else ""
+    url = f"http://{auth_prefix}{TVH_HOST}:{TVH_PORT}{endpoint}"
+    try:
+        req = urllib.request.Request(url)
+        if post_data:
+            data = urllib.parse.urlencode(post_data).encode('utf-8')
+            req.data = data
+        with urllib.request.urlopen(req, timeout=4) as response:
+            return json.loads(response.read().decode('utf-8'))
+    except Exception as e:
+        print(f"Tvheadend Hardware Endpoint connection failed [{endpoint}]: {e}")
+        return None
+
+# =========================================================
+# REAL-TIME ASYNC NETWORK DEMODULATOR SCAN ENGINE
+# =========================================================
+class TvheadendHardwareScanWorker(QThread):
+    progress_updated = pyqtSignal(int, str, list)
+    scan_finished = pyqtSignal(list)
+
+    def run(self):
+        """Asynchronously forces a real network mux evaluation loop inside the backend."""
+        # 1. Look for a configured DVB adapter network interface
+        networks = make_tvh_request("/api/mpegts/network/grid")
+        if networks and "entries" in networks and networks["entries"]:
+            net_uuid = networks["entries"][0].get("uuid")
+            if net_uuid:
+                # Trigger real hardware multiplex sweep loop interrupt
+                make_tvh_request("/api/mpegts/network/scan", {"uuid": net_uuid})
+
+        # 2. Track real physical tuning locking progress
+        for progress in range(10, 101, 10):
+            self.msleep(150)
+            status_text = "Parsing backend service structures..."
+            
+            mux_data = make_tvh_request("/api/mpegts/mux/grid", {"limit": 50})
+            if mux_data and "entries" in mux_data:
+                active_sweeps = [m for m in mux_data["entries"] if m.get("scan_state", 0) != 0]
+                if active_sweeps:
+                    status_text = f"Hardware Tuning: {active_sweeps[0].get('name', 'Locking Mux')}..."
+
+            # Pull current channels assigned on the tuner cards
+            ch_data = make_tvh_request("/api/channel/grid", {"limit": 150})
+            current_channels = []
+            if ch_data and "entries" in ch_data:
+                current_channels = [
+                    {"uuid": e.get("uuid"), "name": e.get("name"), "number": e.get("number", 0)}
+                    for e in ch_data["entries"] if e.get("name")
+                ]
+            
+            self.progress_updated.emit(progress, status_text, current_channels)
+            
+        self.scan_finished.emit(current_channels)
+
+# =========================================================
+# SYSTEM STYLING AND DECODER SCHEMES
+# =========================================================
+LANGUAGES = ["English (GB)", "English (US)", "Español", "Deutsch"]
+TUNER_MODES = ["Digital Terrestrial (DVB-T)", "High-Definition Terrestrial (DVB-T2)"]
+
+STYLE_SHEET = """
+QMainWindow { background-color: #030508; }
+QWidget { color: #FFFFFF; font-family: 'Segoe UI', Arial, sans-serif; }
+QLabel#title { font-size: 30px; font-weight: bold; color: #00FFCC; }
+QLabel#subtitle { font-size: 14px; color: #7A8B9E; }
+QLabel#item-lbl { font-size: 18px; padding: 14px; background-color: rgba(255,255,255,0.02); border: 2px solid transparent; border-radius: 6px; }
+QLabel#item-lbl[selected="true"] { background-color: #00FFCC; color: #04060A; font-weight: bold; border: 2px solid #00FFFF; }
+QWidget#sidebar { background-color: #070B14; border-right: 1px solid rgba(255,255,255,0.06); }
+QLabel#menu-cat { font-size: 16px; color: #A0AEC0; padding: 14px; border-left: 4px solid transparent; }
+QLabel#menu-cat[active="true"] { color: #00FFCC; font-weight: bold; background-color: rgba(0,255,204,0.03); border-left: 4px solid #00FFCC; }
+QLabel#header-title { font-size: 24px; font-weight: bold; color: #00FFCC; }
+QWidget#card-row { background-color: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.05); border-radius: 6px; }
+QWidget#card-row[focused="true"] { border: 2px solid #00FFCC; background-color: rgba(0,255,204,0.02); }
+QWidget#rec-row { border-radius: 6px; border: 1px solid rgba(255,255,255,0.04); }
+QWidget#rec-row[status="completed"] { background-color: rgba(239,68,68,0.05); border-left: 4px solid #EF4444; }
+QWidget#rec-row[status="recording"] { background-color: rgba(16,185,129,0.05); border-left: 4px solid #10B981; }
+QWidget#rec-row[focused="true"] { border: 2px solid #00FFFF; }
+QLabel#grid-block { background-color: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.06); border-radius: 4px; padding: 12px; }
+QLabel#grid-block[focused="true"] { border: 2px solid #00FFCC; background-color: rgba(0,255,204,0.12); font-weight: bold; }
+QProgressBar { border: 1px solid rgba(255,255,255,0.1); border-radius: 4px; background: #000; text-align: center; height: 14px; font-size: 10px; }
+QProgressBar::chunk { background-color: #00FFCC; }
+"""
+
+class FocusArea(Enum):
+    SIDEBAR = 0
+    CONTENT = 1
+
+class MenuCat(Enum):
+    NOW = 0
+    TIMELINE = 1
+    RECORDINGS = 2
+    CONFIG = 3
+
+# =========================================================
+# NATIVE HARDWARE ACCELERATED VIDEO PLAYBACK ENGINES
+# =========================================================
+class VideoPlaybackContainer(QFrame):
+    def __init__(self):
+        super().__init__()
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setStyleSheet("background-color: #000000;")
+        
+        # Instantiate libvlc software runtime thread bindings
+        self.vlc_instance = vlc.Instance("--no-xlib --quiet --network-caching=500")
+        self.media_player = self.vlc_instance.media_player_new()
+
+    def play_live_channel(self, channel_uuid):
+        """Attaches directly to a native network hardware MPEG-TS streaming pipe."""
+        self.media_player.stop()
+        auth = f"{TVH_USER}:{TVH_PASS}@" if TVH_USER and TVH_PASS else ""
+        stream_url = f"http://{auth}{TVH_HOST}:{TVH_PORT}/stream/channel/{channel_uuid}"
+        
+        media = self.vlc_instance.media_new(stream_url)
+        self.media_player.set_media(media)
+        
+        # Crucial cross-platform window handle mapping injection
+        if sys.platform.startswith('linux'):
+            self.media_player.set_xwindow(int(self.winId()))
+        elif sys.platform == "win32":
+            self.media_player.set_hwnd(int(self.winId()))
+        elif sys.platform == "darwin":
+            self.media_player.set_nsobject(int(self.winId()))
+            
+        self.media_player.play()
+
+    def play_dvr_file(self, dvr_uuid):
+        """Attaches directly to an uncompressed stored file transport payload stream."""
+        self.media_player.stop()
+        auth = f"{TVH_USER}:{TVH_PASS}@" if TVH_USER and TVH_PASS else ""
+        stream_url = f"http://{auth}{TVH_HOST}:{TVH_PORT}/dvrfile/{dvr_uuid}"
+        
+        media = self.vlc_instance.media_new(stream_url)
+        self.media_player.set_media(media)
+
+        if sys.platform.startswith('linux'):
+            self.media_player.set_xwindow(int(self.winId()))
+        elif sys.platform == "win32":
+            self.media_player.set_hwnd(int(self.winId()))
+        elif sys.platform == "darwin":
+            self.media_player.set_nsobject(int(self.winId()))
+
+        self.media_player.play()
+
+    def terminate_decode_layers(self):
+        self.media_player.stop()
+
+class WizardSelectPanel(QWidget):
+    def __init__(self, title, subtitle, data_list):
+        super().__init__()
+        self.data = data_list
+        self.index = 0
+        master = QHBoxLayout(self); master.addStretch(3)
+        center = QWidget(); self.layout = QVBoxLayout(center); self.layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        t_lbl = QLabel(title); t_lbl.setObjectName("title")
+        s_lbl = QLabel(subtitle); s_lbl.setObjectName("subtitle")
+        self.layout.addWidget(t_lbl); self.layout.addWidget(s_lbl)
+        
+        self.labels = []
+        for item in self.data:
+            lbl = QLabel(item); lbl.setObjectName("item-lbl"); lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.layout.addWidget(lbl)
+            self.labels.append(lbl)
+        master.addWidget(center, 4); master.addStretch(3)
+        self.refresh()
+
+    def refresh(self):
+        for i, lbl in enumerate(self.labels):
+            lbl.setProperty("selected", "true" if i == self.index else "false")
+            lbl.style().unpolish(lbl); lbl.style().polish(lbl)
+
+    def navigate(self, direction):
+        self.index = max(0, min(len(self.data) - 1, self.index + direction))
+        self.refresh()
+
+# =========================================================
+# CENTRAL CONTROL GRAPHICS CONTEXT RUNTIME
+# =========================================================
+class MasterTVEngine(QMainWindow):
+    STAGE_LANG, STAGE_TUNER, STAGE_SCAN, STAGE_LIVE_TV, STAGE_DASHBOARD = range(5)
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.showFullScreen()
+        QApplication.setOverrideCursor(Qt.CursorShape.BlankCursor)
+        self.setStyleSheet(STYLE_SHEET)
+
+        self.discovered_channels = []
+        self.saved_recordings = []
+        self.current_channel_index = 0
+        
+        self.current_menu_cat = MenuCat.NOW
+        self.focus_area = FocusArea.SIDEBAR
+        self.selected_row = 0
+        self.selected_col = 0
+        self.is_recording_action_focused = False
+
+        self.build_ui_stack()
+
+    def build_ui_stack(self):
+        self.master_stack = QStackedWidget()
+        self.setCentralWidget(self.master_stack)
+
+        self.view_lang = WizardSelectPanel("System Setup Wizard", "Select hardware client display localization parameters", LANGUAGES)
+        self.view_tuner = WizardSelectPanel("RF Adapter Demodulator", "Select native digital tuning standard configuration", TUNER_MODES)
+        
+        # Hardware Scan Panel
+        self.panel_scan = QWidget()
+        scan_lay = QHBoxLayout(self.panel_scan); scan_lay.addStretch(3)
+        c = QWidget(); v = QVBoxLayout(c); v.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        t = QLabel("Polling Active Tvheadend Hardware Modules"); t.setObjectName("title")
+        self.lbl_scan_status = QLabel("Evaluating backend interface hooks..."); self.lbl_scan_status.setObjectName("subtitle")
+        self.pbar_scan = QProgressBar()
+        self.lbl_channels_found_cnt = QLabel("Verified Services: 0")
+        v.addWidget(t); v.addWidget(self.lbl_scan_status); v.addWidget(self.pbar_scan); v.addWidget(self.lbl_channels_found_cnt)
+        scan_lay.addWidget(c, 4); scan_lay.addStretch(3)
+
+        # Main Real Player Viewport
+        self.panel_player = QWidget(); p_lay = QVBoxLayout(self.panel_player); p_lay.setContentsMargins(0,0,0,0)
+        self.player_container = VideoPlaybackContainer(); p_lay.addWidget(self.player_container)
+
+        self.build_dashboard_panel()
+
+        self.master_stack.addWidget(self.view_lang)
+        self.master_stack.addWidget(self.view_tuner)
+        self.master_stack.addWidget(self.panel_scan)
+        self.master_stack.addWidget(self.panel_player)
+        self.master_stack.addWidget(self.panel_dashboard)
+
+    def build_dashboard_panel(self):
+        self.panel_dashboard = QWidget()
+        layout = QHBoxLayout(self.panel_dashboard); layout.setContentsMargins(0, 0, 0, 0); layout.setSpacing(0)
+
+        self.sidebar = QWidget(); self.sidebar.setObjectName("sidebar")
+        self.sidebar_layout = QVBoxLayout(self.sidebar); self.sidebar_layout.setContentsMargins(0, 20, 0, 20)
+
+        self.cat_labels = {}
+        cats = [("Live Channels", MenuCat.NOW), ("EPG Timelines", MenuCat.TIMELINE), ("Stored DVR Assets", MenuCat.RECORDINGS), ("Configuration", MenuCat.CONFIG)]
+        for label_text, enum_val in cats:
+            lbl = QLabel(label_text); lbl.setObjectName("menu-cat")
+            self.sidebar_layout.addWidget(lbl)
+            self.cat_labels[enum_val] = lbl
+        self.sidebar_layout.addStretch()
+
+        self.content_container = QWidget(); self.content_layout = QVBoxLayout(self.content_container); self.content_layout.setContentsMargins(30, 30, 30, 30)
+        self.header_title = QLabel("Live Channels"); self.header_title.setObjectName("header-title")
+        self.sub_stack = QStackedWidget()
+        self.content_layout.addWidget(self.header_title); self.content_layout.addWidget(self.sub_stack)
+
+        self.view_now_pane = QWidget(); self.view_now_layout = QVBoxLayout(self.view_now_pane); self.view_now_layout.setSpacing(12); self.view_now_layout.addStretch()
+        self.view_timeline_pane = QWidget(); self.view_timeline_grid = QGridLayout(self.view_timeline_pane); self.view_timeline_grid.setSpacing(10)
+        
+        self.view_rec_pane = QWidget(); self.view_rec_layout = QVBoxLayout(self.view_rec_pane); self.view_rec_layout.setSpacing(12)
+        self.card_rec_action = QWidget(); self.card_rec_action.setObjectName("card-row")
+        h_lay = QHBoxLayout(self.card_rec_action); h_lay.setContentsMargins(15, 15, 15, 15)
+        self.lbl_rec_action_text = QLabel("●  FORCE RE-SYNC RECORDINGS ARCHIVE")
+        self.lbl_rec_action_text.setStyleSheet("font-size:14px; font-weight:bold;")
+        h_lay.addWidget(self.lbl_rec_action_text)
+        self.rec_list_subcontainer = QWidget(); self.rec_list_sublayout = QVBoxLayout(self.rec_list_subcontainer); self.rec_list_sublayout.setContentsMargins(0,0,0,0); self.rec_list_sublayout.setSpacing(10)
+        self.view_rec_layout.addWidget(self.card_rec_action); self.view_rec_layout.addWidget(self.rec_list_subcontainer); self.view_rec_layout.addStretch()
+
+        self.view_cfg_pane = QWidget(); v_cfg = QVBoxLayout(self.view_cfg_pane); r_cfg = QWidget(); r_cfg.setObjectName("card-row"); rh = QHBoxLayout(r_cfg); rh.setContentsMargins(15,15,15,15)
+        rh.addWidget(QLabel("Production Client Target Backend")); rh.addStretch(); rh.addWidget(QLabel(f"http://{TVH_HOST}:{TVH_PORT}")); v_cfg.addWidget(r_cfg); v_cfg.addStretch()
+
+        self.sub_stack.addWidget(self.view_now_pane)
+        self.sub_stack.addWidget(self.view_timeline_pane)
+        self.sub_stack.addWidget(self.view_rec_pane)
+        self.sub_stack.addWidget(self.view_cfg_pane)
+
+        layout.addWidget(self.sidebar, 1); layout.addWidget(self.content_container, 4)
+
+    def execute_hardware_rf_scan(self):
+        self.scan_worker = TvheadendHardwareScanWorker()
+        self.scan_worker.progress_updated.connect(self.handle_scan_tick_update)
+        self.scan_worker.scan_finished.connect(self.handle_scan_completion)
+        self.scan_worker.start()
+
+    def handle_scan_tick_update(self, progress, status, channels):
+        self.pbar_scan.setValue(progress)
+        self.lbl_scan_status.setText(status)
+        self.discovered_channels = channels
+        self.lbl_channels_found_cnt.setText(f"Verified Services: {len(self.discovered_channels)}")
+
+    def handle_scan_completion(self, channels):
+        self.sync_dvr_recordings_from_backend()
+        self.initialize_dashboard_content_grids()
+        if self.discovered_channels:
+            self.current_channel_index = 0
+            self.master_stack.setCurrentIndex(self.STAGE_LIVE_TV)
+            self.player_container.play_live_channel(self.discovered_channels[0]["uuid"])
+        else:
+            self.transition_to_dashboard()
+
+    def sync_dvr_recordings_from_backend(self):
+        dvr_data = make_tvh_request("/api/dvr/entry/grid", {"limit": 40})
+        self.saved_recordings = []
+        if dvr_data and "entries" in dvr_data:
+            for item in dvr_data["entries"]:
+                state = item.get("sched_status", "")
+                self.saved_recordings.append({
+                    "id": item.get("uuid", ""),
+                    "title": item.get("title", {}).get("eng", "Completed Recording Assets"),
+                    "channel": item.get("channelname", "DVB Stream"),
+                    "time": "Server Drive",
+                    "duration": f"{int(item.get('duration', 0)/60)} Mins",
+                    "status": "recording" if state in ("recording", "active") else "completed"
+                })
+
+    def initialize_dashboard_content_grids(self):
+        # Build live service cards
+        for i in reversed(range(self.view_now_layout.count())):
+            if self.view_now_layout.itemAt(i).widget(): self.view_now_layout.itemAt(i).widget().setParent(None)
+        
+        self.now_channel_cards = []
+        for ch in self.discovered_channels:
+            card = QWidget(); card.setObjectName("card-row"); lay = QHBoxLayout(card); lay.setContentsMargins(15, 15, 15, 15)
+            lbl_name = QLabel(f"CH {ch['number']}: {ch['name']}"); lbl_name.setStyleSheet("font-size: 16px; font-weight:bold;")
+            lbl_info = QLabel("Live Transport Stream Hardware Handle"); lbl_info.setStyleSheet("color: #7A8B9E;")
+            lay.addWidget(lbl_name, 2); lay.addWidget(lbl_info, 5)
+            self.view_now_layout.insertWidget(self.view_now_layout.count()-1, card)
+            self.now_channel_cards.append(card)
+
+        # Build structural EPG grid maps
+        for i in reversed(range(self.view_timeline_grid.count())):
+            if self.view_timeline_grid.itemAt(i).widget(): self.view_timeline_grid.itemAt(i).widget().setParent(None)
+
+        self.timeline_matrix_labels = []
+        for row_idx, ch in enumerate(self.discovered_channels[:6]):
+            row_blocks = []
+            lbl_ch = QLabel(ch["name"]); lbl_ch.setStyleSheet("font-weight: bold; color: #00FFCC;")
+            self.view_timeline_grid.addWidget(lbl_ch, row_idx, 0)
+            for col_idx, slot in enumerate(["EPG Node A", "EPG Node B", "EPG Node C"]):
+                blk = QLabel(slot); blk.setObjectName("grid-block"); blk.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.view_timeline_grid.addWidget(blk, row_idx, col_idx + 1)
+                row_blocks.append(blk)
+            self.timeline_matrix_labels.append(row_blocks)
+
+        self.sync_recordings_list_elements()
+
+    def sync_recordings_list_elements(self):
+        for i in reversed(range(self.rec_list_sublayout.count())):
+            if self.rec_list_sublayout.itemAt(i).widget(): self.rec_list_sublayout.itemAt(i).widget().setParent(None)
+
+        self.rec_row_widgets = []
+        for item in self.saved_recordings:
+            row = QWidget(); row.setObjectName("rec-row"); row.setProperty("status", item["status"])
+            lay = QHBoxLayout(row); lay.setContentsMargins(12, 12, 12, 12)
+            
+            title = QLabel(item["title"]); ch = QLabel(item["channel"]); meta = QLabel(f"{item['time']} ({item['duration']})")
+            status = QLabel("● CAPTURING" if item["status"]=="recording" else "COMPLETED")
+            status.setStyleSheet("color:#10B981;" if item["status"]=="recording" else "color:#EF4444;")
+
+            lay.addWidget(title, 3); lay.addWidget(ch, 2); lay.addWidget(meta, 2); lay.addWidget(status, 1)
+            self.rec_list_sublayout.addWidget(row)
+            self.rec_row_widgets.append(row)
+
+    def transition_to_dashboard(self):
+        self.player_container.terminate_decode_layers()
+        self.master_stack.setCurrentIndex(self.STAGE_DASHBOARD)
+        self.focus_area = FocusArea.SIDEBAR
+        self.selected_row = 0
+        self.update_navigation_visual_states()
+
+    def update_navigation_visual_states(self):
+        for enum_val, label in self.cat_labels.items():
+            is_active = (enum_val == self.current_menu_cat)
+            label.setProperty("active", "true" if is_active else "false")
+            label.setStyleSheet("background-color: rgba(255,255,255,0.08); border-left: 4px solid #00FFFF;" if (is_active and self.focus_area == FocusArea.SIDEBAR) else "")
+            label.style().unpolish(label); label.style().polish(label)
+
+        self.sub_stack.setCurrentIndex(self.current_menu_cat.value)
+        self.header_title.setText(f"{self.cat_labels[self.current_menu_cat].text()}")
+
+        if self.current_menu_cat == MenuCat.NOW:
+            for i, card in enumerate(self.now_channel_cards):
+                card.setProperty("focused", "true" if (self.focus_area == FocusArea.CONTENT and i == self.selected_row) else "false")
+                card.style().unpolish(card)
+        elif self.current_menu_cat == MenuCat.TIMELINE:
+            for r, row in enumerate(self.timeline_matrix_labels):
+                for c, blk in enumerate(row):
+                    blk.setProperty("focused", "true" if (self.focus_area == FocusArea.CONTENT and r == self.selected_row and c == self.selected_col) else "false")
+                    blk.style().unpolish(blk)
+        elif self.current_menu_cat == MenuCat.RECORDINGS:
+            self.card_rec_action.setProperty("focused", "true" if (self.focus_area == FocusArea.CONTENT and self.is_recording_action_focused) else "false")
+            self.card_rec_action.style().unpolish(self.card_rec_action)
+            for i, row in enumerate(self.rec_row_widgets):
+                row.setProperty("focused", "true" if (self.focus_area == FocusArea.CONTENT and not self.is_recording_action_focused and i == self.selected_row) else "false")
+                row.style().unpolish(row)
+
+    def keyPressEvent(self, event: QKeyEvent):
+        key = event.key()
+        stage = self.master_stack.currentIndex()
+
+        if key == Qt.Key.Key_Escape:
+            self.player_container.terminate_decode_layers()
+            QApplication.restoreOverrideCursor()
+            self.close()
+            return
+
+        if stage in (self.STAGE_LANG, self.STAGE_TUNER):
+            panel = self.view_lang if stage == self.STAGE_LANG else self.view_tuner
+            if key == Qt.Key.Key_Up: panel.navigate(-1)
+            elif key == Qt.Key.Key_Down: panel.navigate(1)
+            elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                if stage == self.STAGE_LANG: self.master_stack.setCurrentIndex(self.STAGE_TUNER)
+                else:
+                    self.master_stack.setCurrentIndex(self.STAGE_SCAN)
+                    self.execute_hardware_rf_scan()
+            return
+
+        if stage == self.STAGE_LIVE_TV:
+            if key == Qt.Key.Key_Left: self.transition_to_dashboard()
+            elif key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+                step = -1 if key == Qt.Key.Key_Up else 1
+                if self.discovered_channels:
+                    self.current_channel_index = (self.current_channel_index + step) % len(self.discovered_channels)
+                    self.player_container.play_live_channel(self.discovered_channels[self.current_channel_index]["uuid"])
+            return
+
+        if stage == self.STAGE_DASHBOARD:
+            if self.focus_area == FocusArea.SIDEBAR:
+                if key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+                    step = -1 if key == Qt.Key.Key_Up else 1
+                    self.current_menu_cat = MenuCat((self.current_menu_cat.value + step) % 4)
+                    self.update_navigation_visual_states()
+                elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                    self.focus_area = FocusArea.CONTENT
+                    self.selected_row = 0; self.selected_col = 0
+                    self.is_recording_action_focused = (self.current_menu_cat == MenuCat.RECORDINGS)
+                    self.update_navigation_visual_states()
+                elif key == Qt.Key.Key_Left and self.discovered_channels:
+                    self.master_stack.setCurrentIndex(self.STAGE_LIVE_TV)
+                    self.player_container.play_live_channel(self.discovered_channels[self.current_channel_index]["uuid"])
+            
+            elif self.focus_area == FocusArea.CONTENT:
+                if key == Qt.Key.Key_Left:
+                    self.focus_area = FocusArea.SIDEBAR; self.update_navigation_visual_states()
+                    return
+
+                if self.current_menu_cat in (MenuCat.NOW, MenuCat.TIMELINE):
+                    if key == Qt.Key.Key_Up: self.selected_row = max(0, self.selected_row - 1)
+                    elif key == Qt.Key.Key_Down: self.selected_row = min(len(self.discovered_channels) - 1, self.selected_row + 1)
+                    elif key == Qt.Key.Key_Left and self.current_menu_cat == MenuCat.TIMELINE: self.selected_col = max(0, self.selected_col - 1)
+                    elif key == Qt.Key.Key_Right and self.current_menu_cat == MenuCat.TIMELINE: self.selected_col = min(2, self.selected_col + 1)
+                    elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                        self.current_channel_index = self.selected_row
+                        self.master_stack.setCurrentIndex(self.STAGE_LIVE_TV)
+                        self.player_container.play_live_channel(self.discovered_channels[self.current_channel_index]["uuid"])
+
+                elif self.current_menu_cat == MenuCat.RECORDINGS:
+                    if self.is_recording_action_focused:
+                        if key == Qt.Key.Key_Down and self.saved_recordings:
+                            self.is_recording_action_focused = False; self.selected_row = 0
+                        elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                            self.sync_dvr_recordings_from_backend()
+                            self.sync_recordings_list_elements()
+                    else:
+                        if key == Qt.Key.Key_Up:
+                            if self.selected_row == 0: self.is_recording_action_focused = True
+                            else: self.selected_row -= 1
+                        elif key == Qt.Key.Key_Down: self.selected_row = min(len(self.saved_recordings) - 1, self.selected_row + 1)
+                        elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                            target = self.saved_recordings[self.selected_row]
+                            if target["status"] == "completed":
+                                self.master_stack.setCurrentIndex(self.STAGE_LIVE_TV)
+                                self.player_container.play_dvr_file(target["id"])
+
+                self.update_navigation_visual_states()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = MasterTVEngine()
+    window.show()
+    sys.exit(app.exec())
