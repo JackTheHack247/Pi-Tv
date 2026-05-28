@@ -16,15 +16,16 @@ import vlc
 # =========================================================
 TVH_HOST = "127.0.0.1"
 TVH_PORT = "9981"
-TVH_USER = ""       # Add your local authentication username if configured
-TVH_PASS = ""       # Add your local authentication password if configured
+# Left blank because you are running tvheadend with the --noacl flag
+TVH_USER = ""       
+TVH_PASS = ""       
 
 def make_tvh_request(endpoint, post_data=None):
-    """Executes a live synchronous network request targeting the Tvheadend API."""
-    auth_prefix = f"{TVH_USER}:{TVH_PASS}@" if TVH_USER and TVH_PASS else ""
-    url = f"http://{auth_prefix}{TVH_HOST}:{TVH_PORT}{endpoint}"
+    """Executes a clean, anonymous network request for --noacl mode."""
+    url = f"http://{TVH_HOST}:{TVH_PORT}{endpoint}"
     try:
         req = urllib.request.Request(url)
+        req.add_header('Accept', 'application/json')
         if post_data:
             data = urllib.parse.urlencode(post_data).encode('utf-8')
             req.data = data
@@ -43,15 +44,12 @@ class TvheadendHardwareScanWorker(QThread):
 
     def run(self):
         """Asynchronously forces a real network mux evaluation loop inside the backend."""
-        # 1. Look for a configured DVB adapter network interface
         networks = make_tvh_request("/api/mpegts/network/grid")
         if networks and "entries" in networks and networks["entries"]:
             net_uuid = networks["entries"][0].get("uuid")
             if net_uuid:
-                # Trigger real hardware multiplex sweep loop interrupt
                 make_tvh_request("/api/mpegts/network/scan", {"uuid": net_uuid})
 
-        # 2. Track real physical tuning locking progress
         for progress in range(10, 101, 10):
             self.msleep(150)
             status_text = "Parsing backend service structures..."
@@ -62,7 +60,6 @@ class TvheadendHardwareScanWorker(QThread):
                 if active_sweeps:
                     status_text = f"Hardware Tuning: {active_sweeps[0].get('name', 'Locking Mux')}..."
 
-            # Pull current channels assigned on the tuner cards
             ch_data = make_tvh_request("/api/channel/grid", {"limit": 150})
             current_channels = []
             if ch_data and "entries" in ch_data:
@@ -123,20 +120,17 @@ class VideoPlaybackContainer(QFrame):
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setStyleSheet("background-color: #000000;")
         
-        # Instantiate libvlc software runtime thread bindings
         self.vlc_instance = vlc.Instance("--no-xlib --quiet --network-caching=500")
         self.media_player = self.vlc_instance.media_player_new()
 
     def play_live_channel(self, channel_uuid):
         """Attaches directly to a native network hardware MPEG-TS streaming pipe."""
         self.media_player.stop()
-        auth = f"{TVH_USER}:{TVH_PASS}@" if TVH_USER and TVH_PASS else ""
-        stream_url = f"http://{auth}{TVH_HOST}:{TVH_PORT}/stream/channel/{channel_uuid}"
+        stream_url = f"http://{TVH_HOST}:{TVH_PORT}/stream/channel/{channel_uuid}"
         
         media = self.vlc_instance.media_new(stream_url)
         self.media_player.set_media(media)
         
-        # Crucial cross-platform window handle mapping injection
         if sys.platform.startswith('linux'):
             self.media_player.set_xwindow(int(self.winId()))
         elif sys.platform == "win32":
@@ -149,8 +143,7 @@ class VideoPlaybackContainer(QFrame):
     def play_dvr_file(self, dvr_uuid):
         """Attaches directly to an uncompressed stored file transport payload stream."""
         self.media_player.stop()
-        auth = f"{TVH_USER}:{TVH_PASS}@" if TVH_USER and TVH_PASS else ""
-        stream_url = f"http://{auth}{TVH_HOST}:{TVH_PORT}/dvrfile/{dvr_uuid}"
+        stream_url = f"http://{TVH_HOST}:{TVH_PORT}/dvrfile/{dvr_uuid}"
         
         media = self.vlc_instance.media_new(stream_url)
         self.media_player.set_media(media)
@@ -228,7 +221,6 @@ class MasterTVEngine(QMainWindow):
         self.view_lang = WizardSelectPanel("System Setup Wizard", "Select hardware client display localization parameters", LANGUAGES)
         self.view_tuner = WizardSelectPanel("RF Adapter Demodulator", "Select native digital tuning standard configuration", TUNER_MODES)
         
-        # Hardware Scan Panel
         self.panel_scan = QWidget()
         scan_lay = QHBoxLayout(self.panel_scan); scan_lay.addStretch(3)
         c = QWidget(); v = QVBoxLayout(c); v.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -239,7 +231,6 @@ class MasterTVEngine(QMainWindow):
         v.addWidget(t); v.addWidget(self.lbl_scan_status); v.addWidget(self.pbar_scan); v.addWidget(self.lbl_channels_found_cnt)
         scan_lay.addWidget(c, 4); scan_lay.addStretch(3)
 
-        # Main Real Player Viewport
         self.panel_player = QWidget(); p_lay = QVBoxLayout(self.panel_player); p_lay.setContentsMargins(0,0,0,0)
         self.player_container = VideoPlaybackContainer(); p_lay.addWidget(self.player_container)
 
@@ -331,7 +322,6 @@ class MasterTVEngine(QMainWindow):
                 })
 
     def initialize_dashboard_content_grids(self):
-        # Build live service cards
         for i in reversed(range(self.view_now_layout.count())):
             if self.view_now_layout.itemAt(i).widget(): self.view_now_layout.itemAt(i).widget().setParent(None)
         
@@ -344,7 +334,6 @@ class MasterTVEngine(QMainWindow):
             self.view_now_layout.insertWidget(self.view_now_layout.count()-1, card)
             self.now_channel_cards.append(card)
 
-        # Build structural EPG grid maps
         for i in reversed(range(self.view_timeline_grid.count())):
             if self.view_timeline_grid.itemAt(i).widget(): self.view_timeline_grid.itemAt(i).widget().setParent(None)
 
