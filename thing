@@ -1,0 +1,33 @@
+cat << 'EOF' > .mozconfig
+# Clear this if not a 64bit build
+_BUILD_64=1
+# Set GTK Version to 3
+_GTK_VERSION=3
+# Standard build options for Pale Moon
+ac_add_options --enable-application=palemoon
+ac_add_options --enable-optimize="-O2 -w"
+ac_add_options --enable-default-toolkit=cairo-gtk$_GTK_VERSION
+ac_add_options --enable-jemalloc
+ac_add_options --enable-strip
+ac_add_options --enable-devtools
+ac_add_options --enable-av1
+ac_add_options --disable-webrtc
+ac_add_options --disable-gamepad
+ac_add_options --disable-tests
+ac_add_options --disable-debug
+ac_add_options --disable-necko-wifi
+ac_add_options --disable-updater
+ac_add_options --with-pthreads
+ac_add_options --enable-official-branding
+export MOZILLA_OFFICIAL=1
+
+# Tell the compiler to use our manual Python 2.7 installation
+mk_add_options PYTHON=/usr/local/bin/python2.7
+
+if [ -n "$_BUILD_64" ]; then
+  ac_add_options --x-libraries=/usr/lib64
+else
+  ac_add_options --x-libraries=/usr/lib
+fi
+export MOZ_PKG_SPECIAL=gtk$_GTK_VERSION
+EOF
